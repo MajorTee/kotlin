@@ -90,6 +90,8 @@ private class Transformer(
             return super.visitCall(expression)
         }
 
+        // The HeaderInfoBuilder extracts information (e.g., lower/upper bounds, direction) from the range expression, which is the
+        // receiver for the contains() call.
         val receiver = expression.dispatchReceiver ?: expression.extensionReceiver!!
         val headerInfo = receiver.accept(headerInfoBuilder, expression)
             ?: return super.visitCall(expression)  // The receiver is not a supported range (or not a range at all).
@@ -102,7 +104,8 @@ private class Transformer(
             var replacement = buildContainsComparison(headerInfo, argument, origin)
                 ?: return super.visitCall(expression)  // The call cannot be lowered.
             if (argument.type.isNullable()) {
-                replacement = irIfNull(context.irBuiltIns.booleanType, argument, irFalse(), replacement)
+                // There are stdlib extension functions that return false for null arguments, e.g., IntRange.contains(Int?).
+                replacement = irIfNull(context.irBuiltIns.booleanType, argument.deepCopyWithSymbols(), irFalse(), replacement)
             }
             replacement
         }
