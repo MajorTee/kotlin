@@ -74,6 +74,9 @@
                 </executions>
                 <configuration>
                     <jvmTarget>1.8</jvmTarget>
+                    <args>
+                        <arg>-Xopt-in=org.jetbrains.kotlin.ir.ObsoleteDescriptorBasedAPI</arg>
+                    </args>
                 </configuration>
             </plugin>
             <plugin>
