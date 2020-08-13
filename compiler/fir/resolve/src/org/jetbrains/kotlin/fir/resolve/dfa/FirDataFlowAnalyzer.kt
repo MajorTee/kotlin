@@ -8,22 +8,25 @@ package org.jetbrains.kotlin.fir.resolve.dfa
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.PrivateForInline
 import org.jetbrains.kotlin.fir.contracts.FirResolvedContractDescription
-import org.jetbrains.kotlin.fir.contracts.description.ConeBooleanConstantReference
-import org.jetbrains.kotlin.fir.contracts.description.ConeConditionalEffectDeclaration
-import org.jetbrains.kotlin.fir.contracts.description.ConeConstantReference
-import org.jetbrains.kotlin.fir.contracts.description.ConeReturnsEffectDeclaration
+import org.jetbrains.kotlin.fir.contracts.description.*
+import org.jetbrains.kotlin.fir.contracts.effects
 import org.jetbrains.kotlin.fir.declarations.*
 import org.jetbrains.kotlin.fir.expressions.*
+import org.jetbrains.kotlin.fir.expressions.impl.FirNoReceiverExpression
 import org.jetbrains.kotlin.fir.references.FirResolvedNamedReference
 import org.jetbrains.kotlin.fir.resolve.PersistentImplicitReceiverStack
 import org.jetbrains.kotlin.fir.resolve.ResolutionMode
+import org.jetbrains.kotlin.fir.resolve.calls.candidate
 import org.jetbrains.kotlin.fir.resolve.dfa.cfg.*
+import org.jetbrains.kotlin.fir.resolve.dfa.contracts.ConeBooleanExpressionToFirVisitor
 import org.jetbrains.kotlin.fir.resolve.dfa.contracts.buildContractFir
 import org.jetbrains.kotlin.fir.resolve.dfa.contracts.createArgumentsMapping
+import org.jetbrains.kotlin.fir.resolve.dfa.contracts.unwrap
 import org.jetbrains.kotlin.fir.resolve.transformers.body.resolve.FirAbstractBodyResolveTransformer
 import org.jetbrains.kotlin.fir.resolve.transformers.body.resolve.resultType
 import org.jetbrains.kotlin.fir.symbols.AbstractFirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.CallableId
+import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.types.*
 import org.jetbrains.kotlin.fir.visitors.transformSingle
 import org.jetbrains.kotlin.name.FqName
@@ -103,12 +106,17 @@ abstract class FirDataFlowAnalyzer<FLOW : Flow>(
     protected val variableStorage get() = context.variableStorage
 
     private var contractDescriptionVisitingMode = false
+    private var currentCall: FirCall? = null
 
     protected val any = components.session.builtinTypes.anyType.type
     private val nullableNothing = components.session.builtinTypes.nullableNothingType.type
 
     @PrivateForInline
     var ignoreFunctionCalls: Boolean = false
+
+    fun replaceCurrentCall(call: FirCall?) {
+        currentCall = call
+    }
 
     // ----------------------------------- Requests -----------------------------------
 
@@ -185,6 +193,8 @@ abstract class FirDataFlowAnalyzer<FLOW : Flow>(
         // TODO: questionable
         postponedLambdaEnterNode?.mergeIncomingFlow()
         functionEnterNode.mergeIncomingFlow()
+
+        processTrueInContract(anonymousFunction, functionEnterNode)
     }
 
     private fun exitAnonymousFunction(anonymousFunction: FirAnonymousFunction): ControlFlowGraph {
@@ -200,6 +210,45 @@ abstract class FirDataFlowAnalyzer<FLOW : Flow>(
         enterNode.mergeIncomingFlow()
         exitNode.mergeIncomingFlow()
         enterNode.flow = enterNode.flow.fork()
+    }
+
+    private fun processTrueInContract(anonymousFunction: FirAnonymousFunction, node: FunctionEnterNode){
+        if (!anonymousFunction.isLambda || anonymousFunction.invocationKind == null) return
+        val functionCall = currentCall as? FirFunctionCall ?: return
+        val candidate = functionCall.candidate() ?: return
+        val function = (candidate.symbol as? FirCallableSymbol<*>)?.fir as? FirSimpleFunction ?: return
+        val expressionToParameter = candidate.argumentMapping ?: return
+        val effects = function.contractDescription.effects ?: return
+        if (effects.none { it is ConeTrueInEffectDeclaration }) return
+
+        val valueParameter = expressionToParameter.entries.find { it.key.unwrap() == anonymousFunction }?.value ?: return
+        val valueParameterIndex = function.valueParameters.indexOf(valueParameter)
+
+        val indexToExpression = mutableMapOf<Int, FirExpression>()
+        val parameterToExpression = expressionToParameter.map { it.value to it.key.unwrap() }.toMap()
+        for ((index, parameter) in function.valueParameters.withIndex()) {
+            val expression = parameterToExpression[parameter] ?: parameter.defaultValue
+            if (expression != null) indexToExpression[index] = expression
+        }
+        candidate.extensionReceiverExpression().takeIf { it != FirNoReceiverExpression }?.let { indexToExpression[-1] = it }
+            ?: candidate.dispatchReceiverExpression().takeIf { it != FirNoReceiverExpression }?.let { indexToExpression[-1] = it }
+
+        val lastFlow = node.flow
+
+        for (effect in effects) {
+            if (effect is ConeTrueInEffectDeclaration && effect.target.parameterIndex == valueParameterIndex) {
+                val condition = effect.condition.accept(ConeBooleanExpressionToFirVisitor, indexToExpression) ?: continue
+                condition.transformSingle(components.transformer, ResolutionMode.ContextDependent)
+                val conditionVariable = variableStorage.getOrCreateVariable(lastFlow, condition)
+
+                node.flow = logicSystem.approveStatementsInsideFlow(
+                    node.flow,
+                    conditionVariable eq true,
+                    shouldForkFlow = false,
+                    shouldRemoveSynthetics = true
+                )
+            }
+        }
     }
 
     // ----------------------------------- Classes -----------------------------------
@@ -723,12 +772,15 @@ abstract class FirDataFlowAnalyzer<FLOW : Flow>(
         graphBuilder.exitResolvedQualifierNode(resolvedQualifier).mergeIncomingFlow()
     }
 
-    fun enterCall() {
+    fun enterCall(call: FirCall): FirCall? {
+        val prevCurrentCall = currentCall
+        currentCall = call
         graphBuilder.enterCall()
+        return prevCurrentCall
     }
 
     @OptIn(PrivateForInline::class)
-    fun exitFunctionCall(functionCall: FirFunctionCall, callCompleted: Boolean) {
+    fun exitFunctionCall(functionCall: FirFunctionCall, callCompleted: Boolean, prevCurrentCall: FirCall? = currentCall) {
         if (ignoreFunctionCalls) {
             graphBuilder.exitIgnoredCall(functionCall)
             return
@@ -740,12 +792,14 @@ abstract class FirDataFlowAnalyzer<FLOW : Flow>(
             exitBooleanNot(functionCall, functionCallNode)
         }
         processConditionalContract(functionCall)
+        currentCall = prevCurrentCall
     }
 
-    fun exitDelegatedConstructorCall(call: FirDelegatedConstructorCall, callCompleted: Boolean) {
+    fun exitDelegatedConstructorCall(call: FirDelegatedConstructorCall, callCompleted: Boolean, prevCurrentCall: FirCall?) {
         val (callNode, unionNode) = graphBuilder.exitDelegatedConstructorCall(call, callCompleted)
         unionNode?.let { unionFlowFromArguments(it) }
         callNode.mergeIncomingFlow()
+        currentCall = prevCurrentCall
     }
 
 

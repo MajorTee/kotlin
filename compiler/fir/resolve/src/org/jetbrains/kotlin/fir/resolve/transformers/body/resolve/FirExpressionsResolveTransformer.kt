@@ -11,7 +11,6 @@ import org.jetbrains.kotlin.fir.*
 import org.jetbrains.kotlin.fir.declarations.*
 import org.jetbrains.kotlin.fir.diagnostics.ConeSimpleDiagnostic
 import org.jetbrains.kotlin.fir.diagnostics.ConeStubDiagnostic
-import org.jetbrains.kotlin.fir.diagnostics.ConeIntermediateDiagnostic
 import org.jetbrains.kotlin.fir.diagnostics.DiagnosticKind
 import org.jetbrains.kotlin.fir.expressions.*
 import org.jetbrains.kotlin.fir.expressions.builder.buildErrorExpression
@@ -31,6 +30,7 @@ import org.jetbrains.kotlin.fir.resolve.transformers.StoreReceiver
 import org.jetbrains.kotlin.fir.resolve.transformers.firClassLike
 import org.jetbrains.kotlin.fir.scopes.impl.withReplacedConeType
 import org.jetbrains.kotlin.fir.symbols.StandardClassIds
+import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirClassSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirVariableSymbol
 import org.jetbrains.kotlin.fir.types.*
@@ -246,7 +246,7 @@ open class FirExpressionsResolveTransformer(transformer: FirBodyResolveTransform
         }
         if (functionCall.calleeReference !is FirSimpleNamedReference) return functionCall.compose()
         if (functionCall.calleeReference is FirNamedReferenceWithCandidate) return functionCall.compose()
-        dataFlowAnalyzer.enterCall()
+        val prevCurrentCall = dataFlowAnalyzer.enterCall(functionCall)
         functionCall.annotations.forEach { it.accept(this, data) }
         functionCall.transform<FirFunctionCall, Nothing?>(InvocationKindTransformer, null)
         functionCall.transformTypeArguments(transformer, ResolutionMode.ContextIndependent)
@@ -255,6 +255,7 @@ open class FirExpressionsResolveTransformer(transformer: FirBodyResolveTransform
             try {
                 val initialExplicitReceiver = functionCall.explicitReceiver
                 val resultExpression = callResolver.resolveCallAndSelectCandidate(functionCall)
+                dataFlowAnalyzer.replaceCurrentCall(resultExpression)
                 val resultExplicitReceiver = resultExpression.explicitReceiver
                 if (initialExplicitReceiver !== resultExplicitReceiver && resultExplicitReceiver is FirQualifiedAccess) {
                     // name.invoke() case
@@ -267,7 +268,7 @@ open class FirExpressionsResolveTransformer(transformer: FirBodyResolveTransform
                 throw RuntimeException("While resolving call ${functionCall.render()}", e)
             }
 
-        dataFlowAnalyzer.exitFunctionCall(completeInference, callCompleted)
+        dataFlowAnalyzer.exitFunctionCall(completeInference, callCompleted, prevCurrentCall)
         if (callCompleted) {
             if (enableArrayOfCallTransformation) {
                 arrayOfCallTransformer.toArrayOfCall(completeInference)?.let {
@@ -798,7 +799,7 @@ open class FirExpressionsResolveTransformer(transformer: FirBodyResolveTransform
             })
         }
 
-        dataFlowAnalyzer.enterCall()
+        val prevCurrentCall = dataFlowAnalyzer.enterCall(delegatedConstructorCall)
         var callCompleted = true
         var result = delegatedConstructorCall
         try {
@@ -854,7 +855,7 @@ open class FirExpressionsResolveTransformer(transformer: FirBodyResolveTransform
             callCompleted = completionResult.callCompleted
             return result.compose()
         } finally {
-            dataFlowAnalyzer.exitDelegatedConstructorCall(result, callCompleted)
+            dataFlowAnalyzer.exitDelegatedConstructorCall(result, callCompleted, prevCurrentCall)
         }
     }
 
