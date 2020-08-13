@@ -102,6 +102,7 @@ public class Usage {
 
     private static void appendln(@NotNull StringBuilder sb, @NotNull String string) {
         sb.append(string);
-        StringsKt.appendln(sb);
+        sb.append(string);
+        sb.append('\n');
     }
 }
